@@ -17,6 +17,7 @@ async def init_db():
                 user_id INTEGER,
                 user_name VARCHAR(32),
                 first_name VARCHAR(32),
+                drop_access INTEGER DEFAULT 0,
                 when_created DATE DEFAULT CURRENT_DATE
                 );
             ''')
@@ -36,7 +37,8 @@ async def init_db():
                 photo_url TEXT,
                 channel_url TEXT,
                 anki_url TEXT,
-                drop INTEGER
+                is_drop INTEGER,
+                drop_price INTEGER
                 );
             ''')
 
@@ -65,7 +67,8 @@ async def init_db():
                 order_id INTEGER,
                 name TEXT,
                 art VARCHAR(30),
-                size VARCHAR(10)
+                size VARCHAR(10),
+                price INTEGER
                 );
             ''')
 
@@ -119,12 +122,14 @@ async def upload_products(csv_file_path):
                 for row in reader:
                     try:
                         cleaned_row = {key.strip(): (value.strip() if value else "") for key, value in row.items()}
-                        if cleaned_row["drop"] not in ["0", "1"]:
-                            cleaned_row["drop"] = "0"
+                        if cleaned_row["is_drop"] not in ["0", "1"]:
+                            cleaned_row["is_drop"] = "0"
+                        if not cleaned_row["drop_price"]:
+                            cleaned_row["drop_price"]= "0"
                         await db.execute('''
-                        INSERT INTO products (type, name, maker, material, season, brand, price, art, photo_url, channel_url, anki_url, drop)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                        ''', (cleaned_row['type'], cleaned_row['name'], cleaned_row['maker'], cleaned_row['material'].replace(":", ", ").lower(), cleaned_row['season'].replace(":", ", "), cleaned_row['brand'], int(cleaned_row['price']), cleaned_row['art'], cleaned_row['photo_url'], cleaned_row['channel_url'], cleaned_row['anki_url'], int(cleaned_row["drop"])))
+                        INSERT INTO products (type, name, maker, material, season, brand, price, art, photo_url, channel_url, anki_url, is_drop, drop_price)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        ''', (cleaned_row['type'], cleaned_row['name'], cleaned_row['maker'], cleaned_row['material'].replace(":", ", ").lower(), cleaned_row['season'].replace(":", ", "), cleaned_row['brand'], int(cleaned_row['price']), cleaned_row['art'], cleaned_row['photo_url'], cleaned_row['channel_url'], cleaned_row['anki_url'], int(cleaned_row["is_drop"]), int(cleaned_row["drop_price"])))
                     except Exception as e:
                         flag = 1
                         await asyncio.sleep(0.2)
@@ -148,8 +153,7 @@ async def fetch_products(brand: str):
         else:
             cursor = await db.execute('SELECT * FROM products WHERE brand = ?', (brand,))
         rows = await cursor.fetchall()
-        products = [{"id": row[0], "type": row[1], "name": row[2], "maker": row[3], "material": row[4], "season": row[5], "brand": row[6], "price": row[7], "art": row[8], "photo_url": row[9], "channel_url": row[10], "anki_url": row[11], "drop": row[12]} for row in rows]
-        print(products[0])
+        products = [{"id": row[0], "type": row[1], "name": row[2], "maker": row[3], "material": row[4], "season": row[5], "brand": row[6], "price": row[7], "art": row[8], "photo_url": row[9], "channel_url": row[10], "anki_url": row[11], "is_drop": row[12], "drop_price": row[13]} for row in rows]
         return products
 
 #Взять названия брендов из базы
@@ -169,7 +173,7 @@ async def add_to_basket(user_id: int, art: int, size: str):
 async def fetch_basket(user_id: int, count=False):
     async with aiosqlite.connect(DATABASE_PATH) as db:
         query = """
-        SELECT b.id AS basket_id, p.id AS product_id, p.name, p.price, photo_url, b.size, p.art, p.channel_url
+        SELECT b.id AS basket_id, p.id AS product_id, p.name, p.price, photo_url, b.size, p.art, p.channel_url, p.is_drop, p.drop_price
         FROM basket b
         INNER JOIN products p ON b.art = p.art
         WHERE b.user_id = ?
@@ -187,7 +191,9 @@ async def fetch_basket(user_id: int, count=False):
                     "photo_url": row[4],
                     "size": row[5],
                     "art": row[6],
-                    "channel_url": row[7]
+                    "channel_url": row[7],
+                    "is_drop": row[8],
+                    "drop_price": row[9]
                 }
                 for row in rows
             ]
@@ -256,7 +262,7 @@ async def add_order(user_id, basket, fio, phone_number, address, delivery_way, p
             await db.commit()
             order_id = cursor.lastrowid
             for product in basket:
-                await db.execute("INSERT INTO order_items (order_id, name, art, size) VALUES (?, ?, ?, ?)", (order_id, product['name'], product['art'], product['size']))
+                await db.execute("INSERT INTO order_items (order_id, name, art, size, price) VALUES (?, ?, ?, ?, ?)", (order_id, product['name'], product['art'], product['size'], int(product["price"])))
             await db.commit()
             return 2000 + order_id # Вернуть номер последнего заказа, то есть который добавили только что
         except Exception as e:
@@ -300,7 +306,7 @@ async def fetch_orders(user_id: int, id=0):
         rows = await cursor.fetchall()
         orders = []
         for row in rows:
-            cursor = await db.execute("SELECT p.name, o.art, o.size, p.channel_url, p.price, p.photo_url FROM order_items o INNER JOIN products p ON o.art = p.art WHERE o.order_id = ?", (row[0],))
+            cursor = await db.execute("SELECT p.name, o.art, o.size, p.channel_url, o.price, p.photo_url FROM order_items o INNER JOIN products p ON o.art = p.art WHERE o.order_id = ?", (row[0],))
             items = await cursor.fetchall()
             products = [{"name": item[0], "art": item[1], "size": item[2], "channel_url": item[3], "price": item[4], "photo_url": item[5]} for item in items]
             orders.append({"id": (2000 + row[0]), "user_id": row[1], "fio": row[2], "phone": row[3],
@@ -406,3 +412,28 @@ async def edit_post_link(art, new_link):
             await db.commit()
         except Exception as e:
             await send_admin_message(f"Не удалось изменить ссылку: {e}")
+
+async def give_drop_access_to_user(user_id):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("UPDATE users SET drop_access = ? WHERE user_id = ?", (1, user_id))
+        await db.commit()
+
+async def fetch_drop_access():
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute("SELECT user_id, drop_access FROM users")
+        rows = await cursor.fetchall()
+        access = {}
+        for row in rows:
+            access[row[0]] = row[1]
+        return access
+
+async def delete_drop_access():
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("UPDATE users SET drop_access = ?", (0,))
+        await db.commit()
+
+
+async def stop_drop():
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("UPDATE products SET is_drop = ?", (0,))
+        await db.commit()

@@ -3,11 +3,13 @@ import asyncio
 from database import init_db
 asyncio.run(init_db())
 
+'''
 from database import delete_all_data
 asyncio.run(delete_all_data())
 
 from database import upload_products
 asyncio.run(upload_products('sneakers2.csv'))
+'''
 
 from database import delete_all_users
 asyncio.run(delete_all_users())
@@ -32,7 +34,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-'''
+
 
 import csv
 with open('sneakers2.csv', 'r', encoding='utf-8') as csv_file:
@@ -40,3 +42,4 @@ with open('sneakers2.csv', 'r', encoding='utf-8') as csv_file:
     print(reader.fieldnames)  # Покажет список заголовков
     for row in reader:
         print(row)
+'''

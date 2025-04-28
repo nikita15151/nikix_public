@@ -11,8 +11,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.filters import Command
 from dotenv import load_dotenv
 import json
+import os
 
-bot = Bot(token="8146570104:AAG71W_SZHyEd-ebR-KrF8rKvEeJepYGJMY")
+FETCH_BOT_TOKEN = os.getenv("FETCH_BOT_TOKEN")
+bot = Bot(token=FETCH_BOT_TOKEN)
 dp = Dispatcher()
 product = {}
 

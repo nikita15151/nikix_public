@@ -1,4 +1,5 @@
 import logging
+from itertools import product
 from logging.handlers import RotatingFileHandler
 from venv import logger
 from aiogram import Bot, Dispatcher, types
@@ -13,87 +14,17 @@ from dotenv import load_dotenv
 from datetime import datetime
 import asyncio
 import json
+
+from pyexpat.errors import messages
+
 import database
 import parserAnki
 import random
 import os
-import redis.asyncio as redis
-redis_client = None
-
-# Подключение к redis
-async def redis_connect():
-    global redis_client
-    try:
-        redis_client = redis.Redis(host='localhost', port=6379, db=0)
-        await redis_client.set("test_connection", "ok")
-        await send_admin_message("Успешное подключение к redis")
-    except Exception as e:
-        await send_admin_message(f"Не удалось подключится к redis: {e}")
-        redis_client = None
-
-# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-# Кэш всего списка товаров
-# Кэширование товаров в redis
-async def cache_products():
-    products = await database.fetch_products("all")
-    unique_brands = set()
-    for product in products:
-        product_key = f"product:{product['brand']}:{product['art']}"
-        # Сохраняем товар как хэш
-        try:
-            await redis_client.hset(product_key, mapping=product)
-            unique_brands.add(product["brand"]) # Сохраняем бренд в множество брендов
-        except Exception as e:
-            await send_admin_message(f"Redis не отвечает (кэш products): {e}")
-    brands = list(unique_brands)
-    brands.sort()
-    key = "brands"
-    if await redis_client.exists(key):
-        await redis_client.delete(key)
-    await redis_client.rpush(key, *brands)
-    '''
-    keys = await redis_client.keys(f"product:*:*")
-    brands = set()
-    cursor = 0
-    while True:
-        cursor, keys = await redis_client.scan(cursor, match="product:*")
-        for key in keys:
-            parts = key.decode('utf-8').split(":")
-            if len(parts) >= 2:
-                brand = parts[1]
-                brands.add(brand)
-        if cursor == 0:
-            break
-    brands = list(brands)
-    print(brands)
-    '''
-
-# Получение товаров по бренду
-async def get_cached_products(brand):
-    cached_products = []
-    # ищем все ключи, соответствующие бренду
-    try:
-        if brand == "all":
-            brand_key = f"product:*:*"
-        else:
-            brand_key = f"product:{brand}:*"
-        cursor = 0
-        while True:
-            cursor, keys = await redis_client.scan(cursor, match=brand_key)
-            for key in keys:
-                product = await redis_client.hgetall(key)
-                product = {k.decode('utf-8'): v.decode('utf-8') for k, v in product.items()}
-                product["id"] = int(product["id"])
-                product["price"] = int(product["price"])
-                cached_products.append(product)
-            if cursor == 0:
-                break
-        return cached_products
-    except Exception as e:
-        await send_admin_message(f"Redis не отвечает: {e}")
-        return []
-
-
+from redis_nikix import redis_connect, upload_users, check_and_add_user, cache_products, get_cached_products, \
+    get_search_products, get_redis_brands, upload_user_index_brand, get_brand_and_index, redis_delete_all_products, \
+    redis_delete_product, delete_redis_users, cache_sizes_length, get_sizes_length, cache_support_link, \
+    get_support_link, cache_drop_access, get_drop_access, give_redis_drop_access, cache_drop_info, get_drop_info
 
 # Логирование
 logging.getLogger("aiogram").setLevel(logging.WARNING)
@@ -115,6 +46,8 @@ START_TEXT = "Стартовое сообщение"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage()) # память для хранения списка товаров
 sizes_cache = {}
+length_cache = {}
+drop_password = ""
 
 # Отправить сообщение админу
 async def send_admin_message(message: str, is_log=False):
@@ -122,7 +55,7 @@ async def send_admin_message(message: str, is_log=False):
         await bot.send_message(ADMIN_ID, f"⚠️ <b>Техническое сообщение:</b>\n{message}", parse_mode="HTML")
     logger.info(message)
 
-# Работа с кэшом
+# Работа с кэшом размеров
 try:
     with open("sizes_cache.json", "r") as f:
         sizes_cache = json.load(f)
@@ -139,7 +72,7 @@ async def update_cache():
     time_flag = 0
     while True:
         current_time = int(str(datetime.now().time()).split(":")[0])
-        if current_time >= 7 and current_time <= 22:
+        if current_time >= 1 and current_time <= 22:
             time_flag = 0
             teh_text = "Парсинг закончен"
             sizes = await fetch_sizes() # Сам парсинг
@@ -183,71 +116,62 @@ async def update_cache():
 
 
 async def on_startup(bot: Bot):
+    global drop_password
     #asyncio.create_task(update_cache())
-    # Перенести в on_startup !!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    global redis_client
-    await redis_connect()
-    if redis_client:
-        await cache_products()
-        user_ids = await database.fetch_users(onlyID=1)
-        if not user_ids:
-            user_ids = [0]
-        await redis_client.sadd("user_ids", *user_ids)  # Добавление списка пользователей в redis
+    await database.init_db()
+    message = await redis_connect()
+    await send_admin_message(message)
+    products = await database.fetch_products("all")
+    await cache_products(products)
+    user_ids = await database.fetch_users(onlyID=1)
+    if not user_ids:
+        user_ids = [0]
+    await delete_redis_users()
+    await upload_users(user_ids)  # Добавление списка пользователей в redis
+    await cache_sizes_length() # Добавление длин размеров в redis
+    with open("bot_settings.json", "r") as f:
+        data = json.load(f)
+        support = data["support_link"]
+        drop_password = data["drop_password"]
+    await cache_support_link(support)
+    drop_access = await database.fetch_drop_access()
+    await cache_drop_access(drop_access)
+    await cache_drop_info()
     await send_admin_message(message="Бот запущен и задачи инициализированны")
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 dp.startup.register(on_startup)
 
 
-
-async def check_and_add_user(user_id):
-    if redis_client:
-        try:
-            is_user_exists = await redis_client.sismember("user_ids", user_id)
-            # users = await redis_client.smembers("user_ids")
-            # print(users)
-        except Exception as e:
-            await send_admin_message(f"Redis не отвечает (кэш users): {e}")
-            return None
-        if is_user_exists:
-            return 1
-        else:
-            await redis_client.sadd("user_ids", user_id)
-            print("no")
-            return 0
-    else:
-        return None
-
-
-
 async def start_handler(message: types.Message, isStart=True, isReboot=False):
 
     # Старт
-    await database.init_db()
     user_name = message.from_user.first_name or "Гость"
-    if user_name == "Nikix":
+    if user_name == "Nikix (bot)":
         user_name = "Гость"
 
     if isReboot == False:
-        text = (f'Здравствуйте, {user_name}!\n\nБот представляет полный ассортимент кроссовок магазина '
-            f'<a href="https://t.me/+cbbL5zcx7jQyOWUy">Nikix.</a> Чтобы оформить заказ, пожалуйста, перейдите в «Каталог», '
-            f'выберите нужную модель кроссовок и укажите данные получателя. После этого ожидайте сообщение от менеджера '
-            f'для подтверждения заказа.\n\nПо вопросам пишите в специальный бот по кнопке «Поддержка».')
+        text = (f'Привет, {user_name}!\n\nБот покажет тебе ассортимент магазина '
+            f'<a href="https://t.me/+cbbL5zcx7jQyOWUy">Nikix.</a> Чтобы оформить заказ, пожалуйста, перейди в «Каталог», '
+            f'выберите нужную модель кроссовок и укажите данные получателя. После этого ожидай сообщение от менеджера '
+            f'для подтверждения заказа.\n\nПо вопросам пиши в специальный бот по кнопке «Поддержка».')
     else:
         text = f"Извини, бот был перезапущен, пожалуйста нажми «Каталог» ещё раз"
 
+    support_link = await get_support_link()
+
     builder = InlineKeyboardBuilder()
-    but_cataloge = (InlineKeyboardButton(text="👟 Каталог", callback_data="catalog"))
+    but_catalog = (InlineKeyboardButton(text="👟 Каталог", callback_data="catalog"))
     but_search = (InlineKeyboardButton(text="🔎 Поиск", callback_data="search"))
     # but_feedback = (InlineKeyboardButton(text="💬 Отзывы", callback_data="feedback"))
-    but_support = (InlineKeyboardButton(text="💬 Поддержка", url='http://t.me/nikix_info'))
-    but_my_orders = (InlineKeyboardButton(text="📦 Мои заказы", callback_data="my_orders"))
+    but_support = (InlineKeyboardButton(text="💬 Поддержка", url=support_link))
+    but_my_orders = (InlineKeyboardButton(text="📦 Мои заказы", callback_data="my_orders:ed"))
     count_basket = await database.fetch_basket(user_id=message.chat.id, count=True)
     if count_basket != None and count_basket > 0:
         but_basket_text = f"🛒 Корзина [{count_basket}]"
     else:
         but_basket_text = "🛒 Корзина"
     but_basket = (InlineKeyboardButton(text=but_basket_text, callback_data="go_to_basket_from_menu"))
-    builder.row(but_cataloge)
+    builder.row(but_catalog)
     builder.row(but_search, but_support)
     builder.row(but_basket, but_my_orders)
     if message.from_user.id == ADMIN_ID:
@@ -272,14 +196,44 @@ class adminStates(StatesGroup):
     waiting_for_mail_text = State()
     waiting_for_mail_but_text = State()
     waiting_for_csv_file = State()
+    waiting_for_photos_csv_file = State()
     waiting_for_new_price = State()
+    waiting_for_post_link = State()
+    waiting_for_sizes_length = State()
+    waiting_for_new_proxy = State()
+    waiting_for_new_support = State()
+    waiting_for_drop_password = State()
+    waiting_for_drop_start_date = State()
+    waiting_for_drop_stop_date = State()
 
 @dp.message(Command(commands=["start"], ignore_case=True))
 async def start(message: types.Message, command: types.BotCommand, state: FSMContext):
     arg = command.args
     # Проверка на спец символы для ссылок из корзины
-    if (arg is not None) and ("penis" in arg):
-        data_arg = arg.split("penis")
+    if (arg is not None) and ("art" in arg):
+        # deep link из канала
+        await start_check_user(message)
+        art = arg.split("art")[1]
+        watch_mode = "catalog"
+        brand = "all"
+        back_mode = "0"
+        products = await get_products_from_index(watch_mode=watch_mode, brand=brand)
+        i = 0
+        flag = 0
+        for product in products:
+            if product["art"] == art:
+                flag = 1
+                current_index = i
+                await upload_user_index_brand(user_id=message.from_user.id, current_index=current_index, brand=brand,
+                                              watch_mode=watch_mode, back_mode=back_mode)
+                await send_or_update_product(message.chat.id, message.message_id, product, current_index, len(products),
+                                             is_edit=False, back_mode=back_mode)
+            i += 1
+        if flag == 0:
+            # Если артикул не нашелся то просто удаляем команду старт и ничего не деалем
+            await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+    elif (arg is not None) and ("zov" in arg):
+        data_arg = arg.split("zov")
         arg = data_arg[0]
         last_message_id = data_arg[1]
         back_mode = data_arg[2]
@@ -287,6 +241,18 @@ async def start(message: types.Message, command: types.BotCommand, state: FSMCon
         await state.update_data(basket_id_to_delete=basket_id_to_delete)
         await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
         await bot.delete_message(chat_id=message.chat.id, message_id=last_message_id)
+        products = await get_products_from_index(watch_mode="catalog", brand="all")
+        i = 0
+        flag = 0
+        for product in products:
+            if product["art"] == arg:
+                flag = 1
+                current_index = i
+                await send_or_update_product(message.chat.id, message.message_id, product, current_index, len(products),
+                                             is_edit=False, back_mode=back_mode)
+            i += 1
+        if flag == 0:
+            await start_handler(message)
     elif (arg is not None) and ("show_order" in arg):
         data_arg = arg.split("show_order")
         order_id = data_arg[0]
@@ -302,59 +268,49 @@ async def start(message: types.Message, command: types.BotCommand, state: FSMCon
             new_message = await bot.send_message(text=f"Сообщение для клиента {user_id}:", chat_id=ADMIN_ID, reply_markup=builder.as_markup())
             await state.update_data(last_message_id=new_message.message_id, user_id_for_admin=user_id)
             await state.set_state(adminStates.waiting_for_message)
-            return
+        else:
+            await message.answer(text="Ты не админ", show_alert=True)
+        return
+    elif (arg is not None) and ("photos" in arg):
+        await show_all_photos(arg, message, state)
+        return
     elif arg == "-1":
         await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
         await start_handler(message)
     elif (arg is not None) and ("status" in arg):
-        await bot.delete_message(chat_id=ADMIN_ID, message_id=message.message_id)
-        await choose_status(message, arg)
+        await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+        if message.chat.id == ADMIN_ID:
+            await choose_status(message, arg)
+        else:
+            await message.answer(text="Ты не админ", show_alert=True)
         return
     else:
-        back_mode = 0
-        user_id = message.from_user.id
-        username = message.from_user.username
-        if username:
-            username = f"@{username}"
-        else:
-            username = "Не указан"
-        is_user_exist = await check_and_add_user(user_id)
-        if is_user_exist is None:
-            users = await database.fetch_users(onlyID=1)
-            if user_id in users:
-                is_user_exist = 1
-            if redis_client:
-                await redis_client.sadd("user_ids", *users)  # Добавление списка пользователей в redis
-        if is_user_exist == 0:
-            await database.add_user(user_id=user_id, user_name=username, first_name=message.from_user.first_name)
-            newuser_text = f"Пользователь {username} с id: {user_id} теперь с нами!"
-            await send_admin_message(message=newuser_text)
-
-    if arg == None:
+        await start_check_user(message)
         await start_handler(message)
-        if message.from_user.id != ADMIN_ID:
-            logger.info("Нажат старт")
-    else:
-        products = await database.fetch_products("all")
-        products = products[::-1]
-        i = 0
-        flag = 0
-        for product in products:
-            if product["art"] == arg:
-                flag = 1
-                current_index = i
-                await state.update_data(products=products, current_index=current_index, brand="all")
-                await send_or_update_product(message.chat.id, message.message_id, product, current_index, len(products), is_edit=False, back_mode=back_mode)
-            i += 1
-        if flag == 0:
-            await start_handler(message)
 
+async def start_check_user(message):
+    user_id = message.from_user.id
+    username = message.from_user.username
+    if username:
+        username = f"@{username}"
+    else:
+        username = "Не указан"
+    is_user_exist = await check_and_add_user(user_id)
+    if is_user_exist is None:
+        users = await database.fetch_users(onlyID=1)
+        if user_id in users:
+            is_user_exist = 1
+        await upload_users(users)  # Добавление списка пользователей в redis
+    if is_user_exist == 0:
+        await database.add_user(user_id=user_id, user_name=username, first_name=message.from_user.first_name)
+        newuser_text = f"Пользователь {username} с id: {user_id} теперь с нами!"
+        await send_admin_message(message=newuser_text)
 
 
 @dp.callback_query(lambda c: c.data in ['catalog', 'back_from_products'])
-async def start_catalog(callback_query: types.CallbackQuery):
+async def start_catalog(callback_query: types.CallbackQuery, state: FSMContext):
     # Извлечение брендов из redis
-    brands = await redis_client.lrange("brands", 0, -1)
+    brands = await get_redis_brands()
     brands = [brand.decode('utf-8') for brand in brands]
     # Извлечение брендов из базы данных
     if not brands:
@@ -362,7 +318,6 @@ async def start_catalog(callback_query: types.CallbackQuery):
     if not brands:
         await callback_query.answer("Нет доступных товаров")
         await send_admin_message("Не находятся товары")
-        logger.error("Не находятся товары")
         return
 
     builder = InlineKeyboardBuilder()
@@ -382,7 +337,7 @@ async def start_catalog(callback_query: types.CallbackQuery):
     builder.row(InlineKeyboardButton(text="◀️ Вернутся в меню", callback_data="catalog_back"))
     # builder.adjust(1)
 
-    text = "Выберите бренд для просмотра кроссовок:"
+    text = "Выбери бренд для просмотра кроссовок:"
 
     try:
         # Пытаемся редактировать сообщение как текст
@@ -405,6 +360,8 @@ async def start_catalog(callback_query: types.CallbackQuery):
             parse_mode="HTML",
             reply_markup=builder.as_markup()
         )
+    # На всякий случай очищаем state
+    await state.clear()
 
 
 
@@ -416,53 +373,33 @@ async def back_from_catalog(callback_query: types.CallbackQuery):
 
 #Колбэк, который начинается с brand_:
 @dp.callback_query(lambda c: c.data.startswith('brand:'))
-async def show_products(callback_query: types.CallbackQuery, state: FSMContext):
+async def show_products(callback_query: types.CallbackQuery):
     callback_data = callback_query.data.split(":")
     brand = callback_data[1]  # Извлекаем из колбэка название бренда или all
-    products_from_brand = await get_cached_products(brand)
-    products = sorted(products_from_brand, key=lambda item: int(item["id"]), reverse=True)
-    if products_from_brand == [] or products_from_brand is None:
+    products = await get_cached_products(brand)
+    if products == [] or products is None:
         products_from_brand = await database.fetch_products(brand)
         products = products_from_brand[::-1]
-    await upload_user_index_brand(user_id=callback_query.from_user.id, current_index=0, brand=brand)
+    await upload_user_index_brand(user_id=callback_query.from_user.id, current_index=0, brand=brand, watch_mode="catalog", back_mode="0")
     if len(callback_data) > 2:
         if callback_data[2] == "from_mail":
             await send_or_update_product(callback_query.message.chat.id, callback_query.message.message_id, products[0], 0, len(products), is_edit=False)
             return
     await send_or_update_product(callback_query.message.chat.id, callback_query.message.message_id, products[0], 0,len(products), is_edit=True)
 
-async def upload_user_index_brand(user_id, current_index, brand):
-    index_key = f"index:{user_id}"
-    index = {"current_index": current_index, "brand": brand}
-    await redis_client.hset(index_key, mapping=index)
-
-async def get_brand_and_index(user_id):
-    index = await redis_client.hgetall(f"index:{user_id}")
-    index = {k.decode('utf-8'): v.decode('utf-8') for k, v in index.items()}
-    return index
 
 
-
-
-@dp.callback_query(lambda c: c.data in ['prev', 'next', 'same'])
+@dp.callback_query(lambda c: c.data in ['prev', 'next', 'same', 'same2'])
 async def navigate_catalog(callback_query: types.CallbackQuery, state: FSMContext):
-    '''data = await state.get_data()
-    if data == {}:
-        await start_handler(message=callback_query.message, isStart=True, isReboot=True)
-        return
-    products = data.get("products", [])
-    total_products = len(products)
-    current_index = data.get("current_index", 0)
-    back_mode = data.get("search_back_mode", 0)'''
-    back_mode = 0
     index = await get_brand_and_index(callback_query.from_user.id)
     brand = index["brand"]
     current_index = int(index["current_index"])
-    products_from_brand = await get_cached_products(brand)
-    products = sorted(products_from_brand, key=lambda item: item['id'], reverse=True)
+    watch_mode = index["watch_mode"]
+    back_mode = index["back_mode"]
+    products = await get_products_from_index(watch_mode, brand)
     total_products = len(products)
 
-    if not products:
+    if products == []:
         await start_handler(callback_query.message, isStart=False)
         return
 
@@ -477,29 +414,50 @@ async def navigate_catalog(callback_query: types.CallbackQuery, state: FSMContex
         else:
             current_index = 0
 
-    await state.update_data(current_index=current_index)
-    await upload_user_index_brand(callback_query.from_user.id, current_index, brand)
+    await upload_user_index_brand(callback_query.from_user.id, current_index, brand, watch_mode, back_mode)
     await send_or_update_product(callback_query.message.chat.id, callback_query.message.message_id, products[current_index], current_index, total_products, is_edit=True, back_mode=back_mode)
+    if callback_query.data == "same2":
+        await state.clear()
 
 
 
-async def create_navigative_keyboard(is_has, back_mode, is_one, is_admin):
+async def get_products_from_index(watch_mode, brand):
+    if watch_mode == "catalog":
+        products = await get_cached_products(brand)
+    elif "search" in watch_mode:
+        search_data = watch_mode.split(":")
+        search_mode = search_data[1]
+        param = search_data[2]
+        param2 = None
+        if "size" in watch_mode:
+            global sizes_cache
+            param2 = sizes_cache
+        products = await get_search_products(search_mode=search_mode, param=param, sizes_cache=param2)
+    return products
+
+
+
+async def create_navigative_keyboard(is_has, back_mode, is_one, is_admin, is_drop_close):
     keyboard = InlineKeyboardBuilder()
-    if (back_mode == 0) or (back_mode == None) or ("search_from" in back_mode):
+    if (back_mode == "0") or (back_mode == None) or ("search_from" in back_mode):
         if is_one == False:
             keyboard.button(text="⬅️", callback_data="prev")
             keyboard.button(text="➡️", callback_data="next")
         if is_admin == False:
-            if is_has == 1:
-                keyboard.button(text="📦 Заказать", callback_data="choose_size:for_order")
-                keyboard.button(text="🛒 Добавить в корзину", callback_data="choose_size:for_basket")
+            if not is_drop_close:
+                if is_has == 1:
+                    keyboard.button(text="📦 Заказать", callback_data="choose_size:for_order")
+                    keyboard.button(text="🛒 Добавить в корзину", callback_data="choose_size:for_basket")
+                else:
+                    keyboard.button(text="✖️ Заказать", callback_data="popup_empty")
+                    keyboard.button(text="✖️ Добавить в корзину", callback_data="popup_empty")
             else:
-                keyboard.button(text="❌ Заказать", callback_data="popup_empty")
-                keyboard.button(text="❌ Добавить в корзину", callback_data="popup_empty")
+                keyboard.button(text="🧑‍💻 Ввести пароль", callback_data="enter_drop_password")
         else:
             keyboard.button(text="💵 Изменить цену", callback_data="change_price")
+            keyboard.button(text="🖼 Изменить ссылку на пост", callback_data="change_post_link")
             keyboard.button(text="🗑 Удалить", callback_data="admin_delete_product")
-    if back_mode == 0 or back_mode == None:
+    if back_mode == "0"  or back_mode == None:
         keyboard.button(text="◀️ Назад", callback_data="back_from_products")
         if is_one == False:
             keyboard.adjust(2, 1, 1, 1)
@@ -524,10 +482,13 @@ async def create_navigative_keyboard(is_has, back_mode, is_one, is_admin):
 async def format_number(number):
     return f"{number:,}".replace(',', ' ')
 
-async def send_or_update_product(chat_id, message_id, product, current_index, total_products, is_edit=False, back_mode=0):
+async def send_or_update_product(chat_id, message_id, product, current_index, total_products, is_edit=False, back_mode="0"):
     # Работа с размерами
     global sizes_cache
-    sizes = sizes_cache[str(product["art"])]
+    if product["art"] in sizes_cache:
+        sizes = sizes_cache[str(product["art"])]
+    else:
+        sizes = []
     if len(sizes) != 0:
         size_text = ""
         is_has = 1
@@ -540,20 +501,70 @@ async def send_or_update_product(chat_id, message_id, product, current_index, to
         else:
             size_text += f", {size}"
 
-    price = await format_number(product["price"])
-    product_text = (
-        f"{current_index + 1} из {total_products}\n"
-        f"<b>{product['name']}</b>\n"
-        f"Артикул: {product['art']}\n"
-        # f"Производитель: {product['maker']}\n"
-        f"Материал: {product['material']}\n"
-        f"Сезон: {product['season']}\n\n"
-    )
-    if is_has == 1:
-        product_text += f"Цена: <b>{price}</b> ₽\n"
-    product_text += f"{size_text}\n"
+    # Проверка на то что товар не из дропа
+    if product["is_drop"] == "0":
+        # Если нет, то просто выводим ка обычно
+        product_text = (
+            f"{current_index + 1} из {total_products}\n"
+            f"<b>{product['name']}</b>\n"
+            f"Артикул: {product['art']}\n"
+            # f"Производитель: {product['maker']}\n" в некоторых кроссовках производитель стоит none
+            f"Материал: {product['material']}\n"
+            f"Сезон: {product['season']}\n\n"
+        )
+        if is_has == 1:
+            if product["price"] != 0:
+                price = await format_number(product["price"])
+                product_text += f"Цена: <b>{price}</b> ₽\n"
+            else:
+                await send_admin_message(message=f"Не указана цена на {product['name']}, артикул: {product['art']}")
+                product_text += f"Цена не указана, пожалуйста обратитесь в поддержку\n"
+        product_text += f"{size_text}\n"
+        # Проверяем есть ли ссылка на пост (если её нет значит там стоит 0)
+        if product["channel_url"] != "0":
+            photos_link = product["channel_url"]
+        else:
+            # Если ссылки нет делаем ссылку на команду и в аргумент суем артикул
+            photos_link = f"https://t.me/nikix_store_bot?start={product['art']}photos{message_id}"
+        product_text += f"<a href='{photos_link}'>Ещё фото...</a>"
+        is_drop_close = False
+    else:
+        # Если из дропа, то проверяем введён ли пароль у пользователя
+        drop_info = await get_drop_info()
+        drop_access = await get_drop_access(chat_id)
+        if (drop_access == "0") or (drop_access is None):
+            product_text = f"Для доступа к модели необходимо ввести ключ-пароль. Он появится в канале в <b>{drop_info['drop_start_date']}</b>"
+            is_drop_close = True
+        else:
+            # Если пароль введён, то показываем товар со специальной ценой и информацией об ограниченности по времени
+            is_drop_close = False
+            product_text = (
+                f"{current_index + 1} из {total_products}\n"
+                f"<b>{product['name']}</b>\n"
+                f"Артикул: {product['art']}\n"
+                # f"Производитель: {product['maker']}\n" в некоторых кроссовках производитель стоит none
+                f"Материал: {product['material']}\n"
+                f"Сезон: {product['season']}\n\n"
+            )
+            if is_has == 1:
+                if (product["drop_price"] != 0) and (product["price"] !=0):
+                    old_price = await format_number(product["price"])
+                    new_price = await format_number(product["drop_price"])
+                    price = f"<s>{old_price} ₽</s> <b>{new_price}</b> ₽"
+                    product_text += f"Цена: {price}\n"
+                else:
+                    await send_admin_message(message=f"Не указана цена на {product['name']}, артикул: {product['art']}")
+                    product_text += f"Цена не указана, пожалуйста обратитесь в поддержку\n"
+            product_text += f"{size_text}\n"
+            # Проверяем есть ли ссылка на пост (если её нет значит там стоит 0)
+            if product["channel_url"] != "0":
+                photos_link = product["channel_url"]
+            else:
+                # Если ссылки нет делаем ссылку на команду и в аргумент суем артикул
+                photos_link = f"https://t.me/nikix_store_bot?start={product['art']}photos{message_id}"
+            product_text += f"<a href='{photos_link}'>Ещё фото...</a>"
+            product_text += f"\n\nСпециальная стоимость для дропа действует до <b>{drop_info['drop_stop_date']}</b>"
 
-    product_text += f"<a href='{product["channel_url"]}'>Ещё фото...</a>"
     is_one = False
     if total_products == 1:
         is_one = True
@@ -561,7 +572,7 @@ async def send_or_update_product(chat_id, message_id, product, current_index, to
         is_admin = True
     else:
         is_admin = False
-    keyboard = await create_navigative_keyboard(is_has=is_has, back_mode=back_mode, is_one=is_one, is_admin=is_admin)
+    keyboard = await create_navigative_keyboard(is_has=is_has, back_mode=back_mode, is_one=is_one, is_admin=is_admin, is_drop_close=is_drop_close)
     photo_url = product["photo_url"]
     photo_url = photo_url.strip()
 
@@ -585,15 +596,60 @@ async def show_popup_empty(callback: types.CallbackQuery):
     await callback.answer(text="Нет в наличии этой модели", show_alert=True)
 
 
+class dropStates(StatesGroup):
+    waiting_for_drop_password = State()
+
+# Ввести пароль для дропа
+@dp.callback_query(lambda c: c.data == "enter_drop_password")
+async def ack_drop_password(callback: types.CallbackQuery, state: FSMContext):
+    await bot.delete_message(chat_id=callback.message.chat.id, message_id=callback.message.message_id)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ Отмена", callback_data="same2")
+    new_message = await bot.send_message(
+        chat_id=callback.message.chat.id,
+        text="Напиши код-пароль для доступа к дропу:",
+        reply_markup=builder.as_markup()
+    )
+    await state.set_state(dropStates.waiting_for_drop_password)
+    await state.update_data(last_message_id=new_message.message_id)
+
+@dp.message(dropStates.waiting_for_drop_password)
+async def check_drop_password(message: types.Message, state: FSMContext):
+    global drop_password
+    user_password = message.text.strip()
+    data = await state.get_data()
+    last_message_id = data.get("last_message_id")
+    builder = InlineKeyboardBuilder()
+    if user_password == drop_password:
+        await database.give_drop_access_to_user(message.from_user.id)
+        await give_redis_drop_access(message.from_user.id)
+        text = "✅ Пароль введён успешно.\nТеперь у тебя есть доступ к дропу."
+        builder.button(text="Хорошо", callback_data="same2")
+    else:
+        text = "❌ Пароль не верный. Можешь попробовать ввести ещё раз:"
+        builder.button(text="❌ Отмена", callback_data="same2")
+    await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+    await bot.delete_message(chat_id=message.chat.id, message_id=last_message_id)
+    new_message = await bot.send_message(
+        chat_id=message.chat.id,
+        text=text,
+        reply_markup=builder.as_markup()
+    )
+    await state.update_data(last_message_id=new_message.message_id)
+
+
 
 @dp.callback_query(lambda c: c.data.startswith("choose_size:"))
-async def choose_size_for_add_basket(callback_query: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    products = data.get("products", [])
+async def choose_size_for_add_basket(callback_query: types.CallbackQuery):
+    index = await get_brand_and_index(callback_query.from_user.id)
+    brand = index["brand"]
+    current_index = int(index["current_index"])
+    watch_mode = index["watch_mode"]
+    back_mode = index["back_mode"]
+    products = await get_products_from_index(watch_mode, brand)
     if products == []:
         await start_handler(message=callback_query.message, isStart=True, isReboot=True)
         return
-    current_index = data.get("current_index", 0)
     product = products[current_index]
     if not products:
         await callback_query.answer("Ошибка, перезапусти бота")
@@ -625,6 +681,65 @@ async def choose_size_for_add_basket(callback_query: types.CallbackQuery, state:
 
     #builder.row(*buttons)
     builder.adjust(3)
+    builder.row(InlineKeyboardButton(text="📏 Выбрать в мм", callback_data=f"mm{callback_query.data}"))
+    if callback_data != "for_edit_basket":
+        builder.row(InlineKeyboardButton(text="◀️ Вернутся к каталогу", callback_data="same"))
+    else:
+        arg = f"{product['art']}from_basket{callback_query.message.message_id}from_basket{back_mode}"
+        builder.row(InlineKeyboardButton(text="◀️ Назад", url=f"https://t.me/nikix_store_bot?start={arg}"))
+
+    await bot.edit_message_media(
+        media=types.InputMediaPhoto(media=photo_url, caption=text, parse_mode="HTML"),
+        chat_id=callback_query.message.chat.id,
+        message_id=callback_query.message.message_id,
+        reply_markup=builder.as_markup()
+    )
+
+
+
+@dp.callback_query(lambda c: c.data.startswith("mm"))
+async def choose_size_mm(callback_query: types.CallbackQuery):
+    index = await get_brand_and_index(callback_query.from_user.id)
+    brand = index["brand"]
+    current_index = int(index["current_index"])
+    watch_mode = index["watch_mode"]
+    back_mode = index["back_mode"]
+    products = await get_products_from_index(watch_mode, brand)
+    if products == []:
+        await start_handler(message=callback_query.message, isStart=True, isReboot=True)
+        return
+    product = products[current_index]
+    if not products:
+        await callback_query.answer("Ошибка, перезапусти бота")
+        return
+    photo_url = product["photo_url"]
+
+    global sizes_cache
+    sizes = sizes_cache[product["art"]]
+    builder = InlineKeyboardBuilder()
+    callback_data = callback_query.data.split(":")[1]
+
+    sizes_length = await get_sizes_length(product["art"])
+    if callback_data == "for_basket":
+        text = "Выбери размер (мм) для добавления в корзину:"
+        for size in sizes:
+            builder.button(text=sizes_length[str(size)], callback_data=f"add_in_basket:{size}:normal")
+        # buttons = [InlineKeyboardButton(text=size, callback_data=f"add_in_basket:{size}:normal") for size in sizes]
+    elif callback_data == "for_order":
+        text = "Выбери размер (мм) для оформления заказа:"
+        for size in sizes:
+            builder.button(text=sizes_length[str(size)], callback_data=f"buy_from_catalog:{size}")
+        # buttons = [InlineKeyboardButton(text=size, callback_data=f"buy_from_catalog:{size}") for size in sizes]
+    elif callback_data == "for_edit_basket":
+        text = "Выбери новый размер (мм):"
+        back_mode = callback_query.data.split(":")[2]
+        for size in sizes:
+            builder.button(text=sizes_length[str(size)], callback_data=f"add_in_basket:{size}:change:{back_mode}")
+        # buttons = [InlineKeyboardButton(text=size, callback_data=f"add_in_basket:{size}:change:{back_mode}") for size in sizes]
+
+    # builder.row(*buttons)
+    builder.adjust(3) 
+    builder.row(InlineKeyboardButton(text="📏 Выбрать в EU", callback_data=callback_query.data.split("mm")[1]))
     if callback_data != "for_edit_basket":
         builder.row(InlineKeyboardButton(text="◀️ Вернутся к каталогу", callback_data="same"))
     else:
@@ -643,18 +758,20 @@ async def choose_size_for_add_basket(callback_query: types.CallbackQuery, state:
 @dp.callback_query(lambda c: c.data.startswith("add_in_basket"))
 async def add_in_basket_product(callback_query: types.CallbackQuery, state: FSMContext):
     user_id = callback_query.from_user.id
-    data = await state.get_data()
-    products = data.get("products", [])
-    current_index = data.get("current_index", 0)
+    index = await get_brand_and_index(user_id)
+    brand = index["brand"]
+    current_index = int(index["current_index"])
+    watch_mode = index["watch_mode"]
+    back_mode = index["back_mode"]
+    products = await get_products_from_index(watch_mode, brand)
     product = products[current_index]
 
     callback_data = callback_query.data.split(":")
     size = callback_data[1]
-    product_id = product["id"]
     product_name = product["name"]
     photo_url = product["photo_url"]
 
-    await database.add_to_basket(user_id=user_id, product_id=product_id, size=size)
+    await database.add_to_basket(user_id=user_id, art=product["art"], size=size)
     await callback_query.answer("Кроссовки добавлены в корзину")
 
     builder = InlineKeyboardBuilder()
@@ -664,6 +781,7 @@ async def add_in_basket_product(callback_query: types.CallbackQuery, state: FSMC
         builder.button(text="◀️ Вернутся к каталогу", callback_data="same")
         builder.adjust(1)
     else:
+        data = await state.get_data()
         back_mode = callback_data[3]
         basket_id_to_delete = data.get("basket_id_to_delete")
         text = f"✅ Размер <b>{product_name}</b> изменён на {size}"
@@ -676,37 +794,64 @@ async def add_in_basket_product(callback_query: types.CallbackQuery, state: FSMC
         message_id=callback_query.message.message_id,
         reply_markup=builder.as_markup()
     )
-    logger.info(f"{user_id} добавил товар в корзину")
+    logger.info(f"@{callback_query.from_user.username} добавил товар в корзину")
 
 
 
 @dp.callback_query(lambda c: c.data in ["go_to_basket_from_catalog", "go_to_basket_from_menu"])
-async def go_to_basket_callback(callback: types.CallbackQuery):
-    await go_to_basket(callback)
+async def go_to_basket_callback(callback: types.CallbackQuery, state: FSMContext):
+    await go_to_basket(callback, state)
 
-async def go_to_basket(callback_query: types.CallbackQuery):
+async def go_to_basket(callback_query: types.CallbackQuery, state: FSMContext):
     user_id = callback_query.from_user.id
     basket = await database.fetch_basket(user_id)
     back_mode = callback_query.data
+    index = await get_brand_and_index(callback_query.from_user.id)
+    brand = index["brand"]
+    current_index = int(index["current_index"])
+    watch_mode = index["watch_mode"]
+    back_mode_prob = index["back_mode"]
+    if (back_mode_prob == "0") or ("search" in back_mode_prob):
+        await upload_user_index_brand(user_id=user_id, current_index=current_index, brand=brand, watch_mode=watch_mode,
+                                      back_mode=back_mode_prob)
+        # Если перешли в корзину из каталога или поиска, то записываем back_mode в state, так как при просмотре корзины он может измениться
+        await state.update_data(basket_back_mode=back_mode_prob)
+    else:
+        # Если же мы перешли в корзину из просмотра товара, то берем заранее записанный back_mode из state, потому что в redis храниться перезаписанный (для возврата в корзину)
+        data = await state.get_data()
+        basket_back_mode = data.get("basket_back_mode")
+        await upload_user_index_brand(user_id=user_id, current_index=current_index, brand=brand, watch_mode=watch_mode,
+                                      back_mode=basket_back_mode)
     builder = InlineKeyboardBuilder()
 
     flag = 0
     if basket:
-        total_price_int = sum(item["price"] for item in basket)
-        total_price = await format_number(total_price_int)
-        text = "<b>🛒 Ваша корзина:</b>\n\n"
+        total_price_int = 0
+        text = "<b>🛒 Твоя корзина:</b>\n\n"
         i = 1
         for item in basket:
             # price = await format_number(item["price"])
-            arg = f"{item["art"]}penis{callback_query.message.message_id}penis{back_mode}penis{item['basket_id']}"
+            sizes_length = await get_sizes_length(item["art"])
+            if item['size'] in sizes_length:
+                mm = f" ({sizes_length[(item['size'])]} мм)"
+            else:
+                mm = ""
+            arg = f"{item["art"]}zov{callback_query.message.message_id}zov{back_mode}zov{item['basket_id']}"
+            if item["is_drop"] == 0:
+                price = item["price"]
+            else:
+                price = item["drop_price"]
+            total_price_int += price
+            price = await format_number(price)
             text += (
                 f"{i}. <a href='https://t.me/nikix_store_bot?start={arg}'><b>{item['name']}</b></a>\n"
-                f"Размер: {item['size']}\n"
-                f"Стоимость: {item['price']} ₽\n\n"
+                f"Размер: {item['size']} EU {mm}\n"
+                f"Стоимость: {price} ₽\n\n"
             )
             i += 1
-        text += f"Итого: <b>{total_price}</b> ₽\n"
-        text += f"Выберите действие ниже:"
+        total_price = await format_number(total_price_int)
+        text += f"Всего: <b>{total_price}</b> ₽\n"
+        text += f"Выбери действие ниже:"
 
         builder.button(text="📦 Оформить заказ", callback_data=f"buy_from_basket:{back_mode}")
         builder.button(text="🗑 Очистить корзину", callback_data=f"clear_basket:{back_mode}")
@@ -741,19 +886,28 @@ async def go_to_basket(callback_query: types.CallbackQuery):
         )
         new_message = await bot.send_message(chat_id=callback_query.message.chat.id, text="Корзина")
 
-        text = "<b>🛒 Ваша корзина:</b>\n\n"
+        text = "<b>🛒 Твоя корзина:</b>\n\n"
         i = 1
         for item in basket:
-            price = await format_number(item["price"])
-            arg = f"{item["art"]}penis{new_message.message_id}penis{back_mode}penis{item['basket_id']}"
+            if item["is_drop"] == 0:
+                price = item["price"]
+            else:
+                price = item["drop_price"]
+            price = await format_number(price)
+            sizes_length = await get_sizes_length(item["art"])
+            if item['size'] in sizes_length:
+                mm = f" ({sizes_length[(item['size'])]} мм)"
+            else:
+                mm = ""
+            arg = f"{item["art"]}zov{new_message.message_id}zov{back_mode}zov{item['basket_id']}"
             text += (
                 f"{i}. <a href='https://t.me/nikix_store_bot?start={arg}'><b>{item['name']}</b></a>\n"
-                f"Размер: {item['size']}\n"
+                f"Размер: {item['size']} EU {mm}\n"
                 f"Стоимость: {price} ₽\n\n"
             )
             i += 1
-        text += f"Итого: <b>{total_price}</b> ₽\n"
-        text += f"Выберите действие ниже:"
+        text += f"Всего: <b>{total_price}</b> ₽\n"
+        text += f"Выбери действие ниже:"
 
         await bot.edit_message_text(
             chat_id=callback_query.message.chat.id,
@@ -820,8 +974,14 @@ async def delete_product_basket(callback: types.CallbackQuery, state: FSMContext
 # *************************************************************************************************************
 # *************************************************************************************************************
 # Мои заказы
-@dp.callback_query(lambda c: c.data == "my_orders")
+@dp.callback_query(lambda c: c.data.startswith("my_orders"))
 async def show_my_orders(callback: types.CallbackQuery):
+    mode = callback.data.split(":")[1]
+    if mode == "sd":
+        new_message = await bot.send_message(text="Мои заказы", chat_id=callback.message.chat.id)
+        message_id = new_message.message_id
+    else:
+        message_id = callback.message.message_id
     user_id = callback.from_user.id
     orders = await database.fetch_orders(user_id)
     orders = orders[::-1]
@@ -829,7 +989,7 @@ async def show_my_orders(callback: types.CallbackQuery):
     if orders:
         text = "📦 <b>Твои заказы:</b>\n(Нажми на номер заказа, чтобы узнать о нём подробнее)\n\n"
         for order in orders:
-            arg = f"{order['id']}show_order{callback.message.message_id}"
+            arg = f"{order['id']}show_order{message_id}"
             try:
                 status = await decrypt_status(int(order["status"]))
             except Exception:
@@ -840,13 +1000,14 @@ async def show_my_orders(callback: types.CallbackQuery):
                      f"<b>Статус:</b> {status}\n\n")
     else:
         text = "У тебя нет заказов"
-    builder.button(text="💬 Поддержка", url="http://t.me/nikix_info")
+    support_link = await get_support_link()
+    builder.button(text="💬 Поддержка", url=support_link)
     builder.button(text="◀️ Вернуться в меню", callback_data="catalog_back")
     builder.adjust(1)
     await bot.edit_message_text(
         text=text,
         chat_id=callback.message.chat.id,
-        message_id=callback.message.message_id,
+        message_id=message_id,
         parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=builder.as_markup()
@@ -873,9 +1034,10 @@ async def show_order(message, order_id, last_message_id):
     for product in order["products"]:
         price = await format_number(product['price'])
         total_price += product['price']
+        sizes_length = await get_sizes_length(product["art"])
         text += (f"{i}. <a href='{product['channel_url']}'><b>{product['name']}</b></a>\n"
                  f"<b>Артикул:</b> {product['art']}\n"
-                 f"<b>Размер:</b> {product['size']} (EU)\n"
+                 f"<b>Размер:</b> {product['size']} (EU) ({sizes_length[product['size']]} мм)\n"
                  f"<b>Стоимость:</b> {price} ₽\n\n")
         i += 1
 
@@ -885,10 +1047,11 @@ async def show_order(message, order_id, last_message_id):
              f"<b>Всего:</b> {total_price} ₽")
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="💬 Поддержка", url="http://t.me/nikix_info")
+    support_link = await get_support_link()
+    builder.button(text="💬 Поддержка", url=support_link)
     if order["status"] == '0':
         builder.button(text="❌ Отменить заказ", callback_data=f"sure_cancel:{id}")
-    builder.button(text="◀️ Назад", callback_data="my_orders")
+    builder.button(text="◀️ Назад", callback_data="my_orders:ed")
     builder.adjust(1)
 
     await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
@@ -907,7 +1070,7 @@ async def sure_to_cancel(callback: types.CallbackQuery):
     id = callback.data.split(":")[1]
     text = f"Ты уверен, что хочешь отменить заказ #{int(id) + 2000}?"
     builder = InlineKeyboardBuilder()
-    builder.button(text="Нет", callback_data="my_orders")
+    builder.button(text="Нет", callback_data="my_orders:ed")
     builder.button(text="Да", callback_data=f"cancel_order:{id}")
     builder.adjust(2)
     await bot.edit_message_text(
@@ -925,7 +1088,7 @@ async def cancel_to_order(callback: types.CallbackQuery):
     await change_status(callback_data, 0)
     text = f"❌ Заказ #{order_id} отменён"
     keyboard = InlineKeyboardBuilder()
-    keyboard.button(text="Ок", callback_data="my_orders")
+    keyboard.button(text="Ок", callback_data="my_orders:ed")
     await bot.edit_message_text(
         chat_id=callback.message.chat.id,
         message_id=callback.message.message_id,
@@ -985,7 +1148,7 @@ async def buy(callback: types.CallbackQuery, state: FSMContext):
     else:
         await buy2(callback, state)
         await state.update_data(buy_from="c")
-    logger.info(f"{user_id} начал оформлять заказ")
+    await send_admin_message(f"@{callback.from_user.username} (id: {user_id}) начал оформлять заказ")
 
 @dp.callback_query(lambda c: c.data.startswith("order_anyway"))
 async def let_buy2(callback: types.CallbackQuery, state: FSMContext):
@@ -1002,13 +1165,24 @@ async def buy2(callback, state):
 
     if mode == "buy_from_catalog":
         size = callback_data[1]
-        data = await state.get_data()
-        products = data.get("products", [])
+        index = await get_brand_and_index(callback.from_user.id)
+        brand = index["brand"]
+        current_index = int(index["current_index"])
+        watch_mode = index["watch_mode"]
+        products = await get_products_from_index(watch_mode, brand)
+        product = products[current_index]
         if products == []:
             await start_handler(message=callback.message, isStart=True, isReboot=True)
             return
-        current_index = data.get("current_index", 0)
-        product = products[current_index]
+        if product["price"] == 0:
+            err_text = "К сожалению стоимость не указана. Пожалуйста обратись в поддержку"
+            keyboard = InlineKeyboardBuilder()
+            keyboard.button(text="Ок", callback_data="same")
+            await bot.delete_message(chat_id=callback.message.chat.id, message_id=callback.message.message_id)
+            await bot.send_message(chat_id=callback.message.chat.id, text=err_text, reply_markup=keyboard.as_markup())
+            return
+        if product["is_drop"] == "1":
+            product["price"] = product["drop_price"]
         builder.button(text="СДЭК", callback_data="cdek")
         builder.button(text="Почта России", callback_data="pochta")
         builder.button(text="❌ Отмена", callback_data="same")
@@ -1042,6 +1216,9 @@ async def buy2(callback, state):
 @dp.callback_query(lambda c: c.data == "cdek")
 async def choose_preview(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
+    if not data:
+        await callback.answer(text="Извини, бот был перезапущен. Пожалуйста начни оформлять заказ заново", show_alert=True)
+        return
     back_mode = data.get("back_mode")
     if back_mode == "same":
         count = 1
@@ -1095,6 +1272,9 @@ async def enter_address(callback: types.CallbackQuery, state: FSMContext):
         delivery_mode = "Почта России"
         builder.button(text=" 🗺 Найти в Яндекс Картах", url="https://yandex.ru/maps/?mode=search&text=%D0%9F%D0%BE%D1%87%D1%82%D0%B0%D0%A0%D0%BE%D1%81%D1%81%D0%B8%D0%B8")
     data = await state.get_data()
+    if not data:
+        await callback.answer(text="Извини, бот был перезапущен. Пожалуйста начни оформлять заказ заново", show_alert=True)
+        return
     back_mode = data.get("back_mode")
     builder.button(text="❌ Отмена", callback_data=back_mode)
     builder.adjust(1)
@@ -1142,6 +1322,10 @@ async def get_preview_info(callback: types.CallbackQuery, state: FSMContext):
         primerka = "нужна"
     if callback.data == "preview_no":
         primerka = "не нужна"
+    data = await state.get_data()
+    if not data:
+        await callback.answer(text="Извини, бот был перезапущен. Пожалуйста начни оформлять заказ заново",show_alert=True)
+        return
     await state.update_data(is_preview=primerka)
     await choose_paying_way(chat_id=callback.message.chat.id, state=state)
 
@@ -1173,6 +1357,9 @@ async def get_paying_way(callback: types.CallbackQuery, state: FSMContext):
     else:
         pay_way = "при получении"
         data = await state.get_data()
+        if not data:
+            await callback.answer(text="Извини, бот был перезапущен. Пожалуйста начни оформлять заказ заново",show_alert=True)
+            return
         buy_from = data.get("buy_from")
         basket_count = await database.fetch_basket(user_id=callback.from_user.id, count=True)
         if (buy_from == "b") and (basket_count > 3):
@@ -1264,6 +1451,11 @@ async def get_comment(message: types.Message, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data == "check")
 async def check_data_no_comments(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not data:
+        await callback.answer(text="Извини, бот был перезапущен. Пожалуйста начни оформлять заказ заново",
+                              show_alert=True)
+        return
     await check_data(chat_id=callback.message.chat.id, state=state, user_id=callback.from_user.id)
     await state.set_state(OrderState.waiting_none)
 
@@ -1320,9 +1512,10 @@ async def check_data(chat_id, state, user_id):
             delivery_price_text = "Бесплатно"
         else:
             delivery_price_text = f"{delivery_price} ₽"
+        sizes_length = await get_sizes_length(buying_product["art"])
         text += (f"<a href='{buying_product['channel_url']}'><b>{buying_product['name']}</b></a>\n"
                  f"<b>Артикул:</b> {buying_product['art']}\n"
-                 f"<b>Размер:</b> {size} (EU)\n"
+                 f"<b>Размер:</b> {size} (EU) ({sizes_length[size]} мм)\n"
                  f"<b>Стоимость:</b> {price} ₽\n\n"
                  f"<b>Доставка:</b> {delivery_price_text}\n"
                  f"<b>Итого:</b> {total_price} ₽")
@@ -1332,11 +1525,16 @@ async def check_data(chat_id, state, user_id):
         i = 1
         total_price = 0
         for product in basket:
-            price = await format_number(product['price'])
-            total_price += product['price']
+            if product["is_drop"] == 0:
+                price = await format_number(product['price'])
+                total_price += product['price']
+            else:
+                price = await format_number(product['drop_price'])
+                total_price += product['drop_price']
+            sizes_length = await get_sizes_length(product["art"])
             text += (f"<b>{i}.</b> <a href='{product['channel_url']}'><b>{product['name']}</b></a>\n"
                      f"<b>Артикул:</b> {product['art']}\n"
-                     f"<b>Размер:</b> {product['size']} (EU)\n"
+                     f"<b>Размер:</b> {product['size']} (EU) ({sizes_length[product['size']]})\n"
                      f"<b>Стоимость:</b> {price} ₽\n\n")
             i += 1
         total_price += delivery_price
@@ -1350,9 +1548,10 @@ async def check_data(chat_id, state, user_id):
         button_data = f"buy_from_basket:{back_mode}"
 
     builder = InlineKeyboardBuilder()
+    support_link = await get_support_link()
     builder.button(text="✅ Данные верны", callback_data=f"order_is_ok")
     builder.button(text="🔄 Ввести заново", callback_data=button_data)
-    builder.button(text="💬 Поддержка", url='http://t.me/nikix_info')
+    builder.button(text="💬 Поддержка", url=support_link)
     builder.button(text="❌ Отмена", callback_data=back_mode)
     builder.adjust(1)
     await bot.edit_message_text(
@@ -1371,6 +1570,10 @@ async def check_data(chat_id, state, user_id):
 async def make_order(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     data = await state.get_data()
+    if not data:
+        await callback.answer(text="Извини, бот был перезапущен. Пожалуйста начни оформлять заказ заново",
+                              show_alert=True)
+        return
     back_mode = data.get("back_mode")
     delivery_mode = data.get("delivery_mode")
     address = data.get("address")
@@ -1388,8 +1591,13 @@ async def make_order(callback: types.CallbackQuery, state: FSMContext):
         basket = []
         basket.append(buying_product)
     else:
-        basket = await database.fetch_basket(user_id)
-    builder.button(text="📦 Мои заказы", callback_data="my_orders")
+        basket_db = await database.fetch_basket(user_id)
+        basket = []
+        for item in basket_db:
+            if item["is_drop"] == 1:
+                item["price"] = item["drop_price"]
+            basket.append(item)
+    builder.button(text="📦 Мои заказы", callback_data="my_orders:ed")
     builder.button(text="◀️ В меню", callback_data="catalog_back")
     builder.adjust(1)
     text = "✅ Заказ принят. Тебе ответят в ближайшее время.\nПо вопросам можешь писать в <a href='https://t.me/nikix_info'>поддержку</a>"
@@ -1466,22 +1674,19 @@ async def choose_search_param(callback: types.CallbackQuery, state: FSMContext):
     elif mode == "search_from_size":
         text = "Выбери размер для поиска (EU)"
         global sizes_cache
-        sizes = set()
+        sizes = []
+        sizes_keys = {}
         for key in sizes_cache:
             for size in sizes_cache[key]:
                 if size:
-                    try:
-                        is_int = float(size) % 1 == 0
-                    except Exception:
-                        size = size.split("-")[-1]
-                        is_int = float(size) % 1 == 0
-                    if is_int:
-                        sizes.add(int(size))
+                    if "-" not in size:
+                        sizes_keys[size] = float(size.split(" ")[0])
                     else:
-                        sizes.add(float(size))
-        sorted_sizes = sorted(sizes)
+                        size = size.split("-")[-1]
+                        sizes_keys[size] = float(size.split("-")[-1])
+        sorted_sizes = dict(sorted(sizes_keys.items(), key=lambda item: item[1]))
         for size in sorted_sizes:
-            keyboard.button(text=f"{str(size)}", callback_data=f"choose_size_search:{size}")
+            keyboard.button(text=f"{size}", callback_data=f"choose_size_search:{size}")
         keyboard.adjust(3)
     elif mode == "search_from_art":
         text = "Отправь артикул для поиска:"
@@ -1506,58 +1711,54 @@ async def choose_search_param(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(search_back_mode=0, last_message_id=callback.message.message_id)
 
 @dp.callback_query(lambda c: c.data.startswith("choose_season:"))
-async def get_season(callback: types.CallbackQuery, state: FSMContext):
+async def get_season(callback: types.CallbackQuery):
     season = callback.data.split(":")[1]
     if season == "demi":
-        data = "%демисезон%"
+        data = "демисезон"
         text_season = "демисезона"
     elif season == "summer":
-        data = "%лето%"
+        data = "лето"
         text_season = "летнего сезона"
     elif season == "winter":
-        data = "%зима%"
+        data = "зима"
         text_season = "зимнего сезона"
     else:
         print("Ошибка поиска")
         return
-    products = await database.fetch_products_from_search(mode=0, data=data)
+    #products = await database.fetch_products_from_search(mode=0, data=data)
+    products = await get_search_products(search_mode="season", param=data)
     if products != []:
         await bot.delete_message(chat_id=callback.message.chat.id, message_id=callback.message.message_id)
         back_mode = "search_from_season"
-        await state.update_data(products=products, current_index=0, search_back_mode=back_mode)
+        await upload_user_index_brand(user_id=callback.from_user.id, current_index=0, brand="none", watch_mode=f"search:season:{data}", back_mode=back_mode)
         await send_or_update_product(callback.message.chat.id, callback.message.message_id, products[0], 0, len(products), is_edit=False, back_mode=back_mode)
     else:
         await callback.answer(text=f"Пока нет кроссовок для {text_season}", show_alert=True)
 
 @dp.callback_query(lambda c: c.data.startswith("choose_size_search"))
-async def choose_size_search(callback: types.CallbackQuery, state: FSMContext):
+async def choose_size_search(callback: types.CallbackQuery):
     global sizes_cache
     size = callback.data.split(":")[1]
-    arts = []
-    for art in sizes_cache:
-        if (size in sizes_cache[art]):
-            arts.append(art)
-        if float(size) % 1 == 0:
-            if (f"{size}-{int(size)+1}" in sizes_cache[art]) or (f"{int(size)-1}-{size}" in sizes_cache[art]):
-                arts.append(art)
-    products = await database.fetch_products_from_search(1, arts)
+    #products = await database.fetch_products_from_search(1, arts)
+    products = await get_search_products("size", size, sizes_cache)
     if products != []:
         await bot.delete_message(chat_id=callback.message.chat.id, message_id=callback.message.message_id)
         back_mode = "search_from_size"
-        await state.update_data(products=products, current_index=0, search_back_mode=back_mode)
+        await upload_user_index_brand(user_id=callback.from_user.id, current_index=0, brand="all", watch_mode=f"search:size:{size}", back_mode=back_mode)
         await send_or_update_product(callback.message.chat.id, callback.message.message_id, products[0], 0, len(products), is_edit=False, back_mode=back_mode)
     else:
         await callback.answer(f"Пока нет кроссовок {size}-го размера", show_alert=True)
+        await send_admin_message(f"Не найдены кроссовки {size} размера")
 
 @dp.message(SearchState.waiting_for_art)
 async def get_art_from_message(message: types.Message, state: FSMContext):
-    art = message.text.strip()
-    products = await database.fetch_products_from_search(2, art)
+    art = message.text.strip().upper()
+    products = await get_search_products(search_mode="art", param=art)
     if products != []:
         await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
         back_mode = "search_from_art"
-        await state.update_data(products=products, current_index=0, search_back_mode=back_mode)
         await send_or_update_product(message.chat.id, message.message_id, products[0], 0, len(products), is_edit=False, back_mode=back_mode)
+        await state.clear()
     else:
         data = await state.get_data()
         last_message_id = data.get("last_message_id")
@@ -1584,12 +1785,20 @@ async def callback_admin(callback: types.CallbackQuery):
 async def admin_panel(callback: types.CallbackQuery):
     if callback.from_user.id == ADMIN_ID:
         builder = InlineKeyboardBuilder()
-        builder.button(text="👤 Получить список пользователей", callback_data="admin_get_users")
-        builder.button(text="💬 Создать рассылку", callback_data="make_mailing")
-        builder.button(text="➕ Загрузить товары (csv)", callback_data="add_products")
+        builder.button(text="👤 Пользователи", callback_data="admin_get_users")
+        builder.button(text="💬 Рассылка", callback_data="make_mailing")
+        builder.button(text="➕ Товары (csv)", callback_data="add_products")
+        builder.button(text="🖼 Доп фото", callback_data="add_photo_links")
+        builder.button(text="📦 Назначить дроп", callback_data="create_drop")
+        builder.button(text="⛔️ Дроп окончен", callback_data="stop_drop")
+        builder.button(text="🖥 Прокси", callback_data="edit_proxy")
+        builder.button(text="👥 Поддержка", callback_data="edit_support")
+        builder.button(text="🌐 Принудительный парсинг", callback_data="admin_parse")
+        builder.button(text="📏 Загрузить таблицы размеров (txt)", callback_data="add_sizes_length")
+        builder.button(text="👟 Список товаров", callback_data="get_current_product_list")
         builder.button(text="🗑 Удалить все товары", callback_data="sure_admin_delete")
         builder.button(text="◀️ Назад", callback_data="back_to_start")
-        builder.adjust(1)
+        builder.adjust(2, 2, 2, 2, 1, 1, 1)
         try:
             await bot.edit_message_text(
                 text="🛠 <b>Админ-панель</b>",
@@ -1608,6 +1817,214 @@ async def admin_panel(callback: types.CallbackQuery):
     else:
         await send_admin_message(f"Долбаёб @{callback.from_user.username} с id: {callback.from_user.id} пытался зайти в админ-панель")
 
+
+# Создание дропа
+@dp.callback_query(lambda c: c.data == "create_drop")
+async def make_drop(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(adminStates.waiting_for_drop_password)
+    text = ("Бот всегда требует пароль, если в товаре is_drop равно 1. "
+            "Это окно всего лишь меняет код доступа и дату (только для описания). Дроп появится в боте когда ты загрузишь кроссовки с is_drop равным 1. "
+            "Далее просто отправишь пароль в канал в нужное время. "
+            "Для выключения дропа нужно изменить параметр is_drop, для этого есть кнопка в админ-панели 'Остановить дроп'\n\n"
+            "Отправь код-пароль для дропа. Советую использовать только большие буквы как в anki")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ Отмена", callback_data="admin")
+    await bot.edit_message_text(
+        chat_id=callback.message.chat.id,
+        message_id=callback.message.message_id,
+        text=text,
+        reply_markup=builder.as_markup()
+    )
+    await state.update_data(last_message_id=callback.message.message_id)
+
+@dp.message(adminStates.waiting_for_drop_password)
+async def edit_drop_password(message: types.Message, state: FSMContext):
+    await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+    password = message.text.strip()
+    global drop_password
+    drop_password = password
+    with open("bot_settings.json", "r") as f:
+        jdata = json.load(f)
+    jdata["drop_password"] = password
+    with open("bot_settings.json", "w") as f:
+        json.dump(jdata, f)
+    data = await state.get_data()
+    last_message_id = data.get("last_message_id")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ Отмена", callback_data="admin")
+    await bot.edit_message_text(
+        chat_id=message.chat.id,
+        message_id=last_message_id,
+        text=f"✅ Теперь отправь дату и время старта дропа. Это будет использоваться только для описания. Например '13:00 13 мая'",
+        reply_markup=builder.as_markup()
+    )
+    await state.set_state(adminStates.waiting_for_drop_start_date)
+
+@dp.message(adminStates.waiting_for_drop_start_date)
+async def edit_drop_password(message: types.Message, state: FSMContext):
+    await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+    start_date = message.text.strip()
+    with open("bot_settings.json", "r") as f:
+        jdata = json.load(f)
+    jdata["drop_start_date"] = start_date
+    with open("bot_settings.json", "w") as f:
+        json.dump(jdata, f)
+    data = await state.get_data()
+    last_message_id = data.get("last_message_id")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ Отмена", callback_data="admin")
+    await bot.edit_message_text(
+        chat_id=message.chat.id,
+        message_id=last_message_id,
+        text=f"✅ Хорошо, теперь отправь дату и время окончания дропа. Пример '13:00 14 мая'",
+        reply_markup=builder.as_markup()
+    )
+    await state.set_state(adminStates.waiting_for_drop_stop_date)
+
+@dp.message(adminStates.waiting_for_drop_stop_date)
+async def edit_drop_password(message: types.Message, state: FSMContext):
+    await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+    stop_date = message.text.strip()
+    with open("bot_settings.json", "r") as f:
+        jdata = json.load(f)
+    jdata["drop_stop_date"] = stop_date
+    with open("bot_settings.json", "w") as f:
+        json.dump(jdata, f)
+    data = await state.get_data()
+    last_message_id = data.get("last_message_id")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Хорошо", callback_data="admin")
+    await bot.edit_message_text(
+        chat_id=message.chat.id,
+        message_id=last_message_id,
+        text=f"✅ Пароль и даты установлены. Удачного дропа!",
+        reply_markup=builder.as_markup()
+    )
+    await cache_drop_info()
+    await state.clear()
+    await database.delete_drop_access()
+    drop_access = await database.fetch_drop_access()
+    await cache_drop_access(drop_access)
+
+
+@dp.callback_query(lambda c: c.data == "stop_drop")
+async def sure_stop_drop(callback: types.CallbackQuery):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Да", callback_data="sure_stop_drop")
+    builder.button(text="Нет", callback_data="admin")
+    await bot.edit_message_text(
+        chat_id=callback.message.chat.id,
+        message_id=callback.message.message_id,
+        text="Уверен, что хочешь остановить дроп? Убедись что время дропа подошло к концу.",
+        reply_markup=builder.as_markup()
+    )
+
+@dp.callback_query(lambda c: c.data == "sure_stop_drop")
+async def admin_stop_drop(callback: types.CallbackQuery):
+    await database.stop_drop()
+    products = await database.fetch_products("all")
+    await redis_delete_all_products()  # Если вылезет ошибка то проверить эту строку
+    await cache_products(products)
+    await database.delete_drop_access()
+    drop_access = await database.fetch_drop_access()
+    await cache_drop_access(drop_access)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Ok", callback_data="admin")
+    await bot.edit_message_text(
+        chat_id=callback.message.chat.id,
+        message_id=callback.message.message_id,
+        text="Поздравляю, дроп закончен",
+        reply_markup=builder.as_markup()
+    )
+
+
+
+@dp.callback_query(lambda c: c.data == "edit_support")
+async def admin_edit_support(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(adminStates.waiting_for_new_support)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ Отмена", callback_data="admin")
+    await bot.edit_message_text(
+        chat_id = callback.message.chat.id,
+        message_id = callback.message.message_id,
+        text = "Отправь новую ссылку на поддержку в виде: http://t.me/nikix_info",
+        reply_markup=builder.as_markup()
+    )
+    await state.update_data(last_message_id=callback.message.message_id)
+
+
+@dp.message(adminStates.waiting_for_new_support)
+async def edit_support_json(message: types.Message, state: FSMContext):
+    support_link = message.text.strip()
+    await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+    with open("bot_settings.json", "r") as f:
+        jdata = json.load(f)
+    jdata["support_link"] = support_link
+    with open("bot_settings.json", "w") as f:
+        json.dump(jdata, f)
+    await cache_support_link(support_link)
+    data = await state.get_data()
+    last_message_id = data.get("last_message_id")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Ок", callback_data="admin")
+    await bot.edit_message_text(
+        chat_id=message.chat.id,
+        message_id=last_message_id,
+        text=f"✅ Ссылка изменёна на {support_link}",
+        reply_markup=builder.as_markup()
+    )
+    await state.clear()
+
+
+@dp.callback_query(lambda c: c.data == "admin_parse")
+async def start_admin_parse(callback: types.CallbackQuery):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Ok", callback_data="admin")
+    await bot.edit_message_text(
+        chat_id=callback.message.chat.id,
+        message_id=callback.message.message_id,
+        text="✅ Парсинг начался",
+        reply_markup=builder.as_markup()
+    )
+    await update_cache()
+
+
+@dp.callback_query(lambda c: c.data == "edit_proxy")
+async def admin_edit_proxy(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(adminStates.waiting_for_new_proxy)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ Отмена", callback_data="admin")
+    await bot.edit_message_text(
+        chat_id = callback.message.chat.id,
+        message_id = callback.message.message_id,
+        text = "Отправь новый прокси (только англ. текст) в виде: http://quIFjeCM1N:INDeocNfeO@51.15.15.230:9061",
+        reply_markup=builder.as_markup()
+    )
+    await state.update_data(last_message_id=callback.message.message_id)
+
+
+@dp.message(adminStates.waiting_for_new_proxy)
+async def edit_proxy_json(message: types.Message, state: FSMContext):
+    proxy = message.text.strip()
+    await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+    with open("bot_settings.json", "r") as f:
+        jdata = json.load(f)
+    jdata["proxy"] = proxy
+    with open("bot_settings.json", "w") as f:
+        json.dump(jdata, f)
+    data = await state.get_data()
+    last_message_id = data.get("last_message_id")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Ок", callback_data="admin")
+    await bot.edit_message_text(
+        chat_id=message.chat.id,
+        message_id=last_message_id,
+        text=f"✅ Прокси изменён на {proxy}",
+        reply_markup=builder.as_markup()
+    )
+    await state.clear()
+
+
 @dp.callback_query(lambda c: c.data == "get_users_for_admin")
 async def get_users_admin(callback: types.CallbackQuery):
     await database.fetch_users(onlyID=0)
@@ -1618,13 +2035,14 @@ async def get_message_for_client(message: types.Message, state: FSMContext):
     data = await state.get_data()
     last_message_id = data.get("last_message_id")
     text_for_client = message.text
-    await state.update_data(text_for_client=text_for_client)
+    await state.update_data(text_for_client=text_for_client, mes_with_but=0)
     await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
     user_id = data.get("user_id_for_admin")
     username = await database.fetch_username_from_id(user_id)
     text = f"Текст для клиента {username[0]}\n\n{text_for_client}\n\nМожно отправить новый текст"
     keyboard = InlineKeyboardBuilder()
     keyboard.button(text="💬 Отправить сообщение", callback_data="admin_send:1")
+    keyboard.button(text="📦 Добавить кнопку 'Мои заказы'", callback_data="add_orders_but")
     keyboard.button(text="❌ Отмена", callback_data="admin_send:0")
     keyboard.adjust(1)
     await bot.edit_message_text(
@@ -1635,16 +2053,38 @@ async def get_message_for_client(message: types.Message, state: FSMContext):
         reply_markup=keyboard.as_markup()
     )
 
+@dp.callback_query(lambda c: c.data == "add_orders_but")
+async def add_orders_button(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    text_for_client = data.get("text_for_client")
+    await state.update_data(mes_with_but=1)
+    user_id = data.get("user_id_for_admin")
+    username = await database.fetch_username_from_id(user_id)
+    text = f"✅ Кнопка добавлена\nТекст для клиента {username[0]}\n\n{text_for_client}\n\nМожно отправить новый текст"
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(text="💬 Отправить сообщение", callback_data="admin_send:1")
+    keyboard.button(text="❌ Отмена", callback_data="admin_send:0")
+    keyboard.adjust(1)
+    await bot.edit_message_text(
+        text=text,
+        chat_id=callback.message.chat.id,
+        message_id=callback.message.message_id,
+        parse_mode="HTML",
+        reply_markup=keyboard.as_markup()
+    )
+
 @dp.callback_query(lambda c: c.data.startswith("admin_send"))
 async def send_message_from_admin(callback: types.CallbackQuery, state: FSMContext):
     if callback.data.split(":")[1] == "1":
         data = await state.get_data()
         user_id = data.get("user_id_for_admin")
         text_for_client = data.get("text_for_client")
+        mes_with_but = data.get("mes_with_but")
         try:
             builder = InlineKeyboardBuilder()
             # url="https://t.me/nikix_store_bot?start=-1"
-            builder.button(text="Хорошо", callback_data="client_mes_ok")
+            if mes_with_but == 1:
+                builder.button(text="📦 Мои заказы", callback_data="my_orders:sd")
             await bot.send_message(text=text_for_client, chat_id=user_id, reply_markup=builder.as_markup())
         except Exception as e:
             await bot.edit_message_text(
@@ -1762,7 +2202,8 @@ async def change_status(callback_data, message_id):
         logger.error(f"Не удалось изменить статус:{e}")
     if message_id != 0:
         builder = InlineKeyboardBuilder()
-        builder.button(text="Хорошо", callback_data="client_mes_ok")
+        arg = f"admin_send_{order["user_id"]}"
+        builder.button(text="💬 Написать клиенту через бота", url=f"https://t.me/nikix_store_bot?start={arg}")
         await bot.edit_message_text(
             text="✅ Статус изменён",
             chat_id=ADMIN_ID,
@@ -1957,9 +2398,9 @@ async def start_mail(callback: types.CallbackQuery, state: FSMContext):
 async def get_bot_users(callback: types.CallbackQuery):
     users = await database.fetch_users(onlyID=0)
     file_content = "Список пользователей:\n\n"
-    i = 0
+    i = 1
     for user in users:
-        file_content += f"{i}. username: {user['user_name']}, имя: {user['first_name']}, id: {user['user_id']}, дата создания: {user['when_created']}\n"
+        file_content += f"{i}. username: {user['user_name']}, имя: {user['first_name']}, id: {user['user_id']}\n"
         i += 1
 
     with open("users.txt", "w", encoding="utf-8") as file:
@@ -1992,6 +2433,7 @@ async def sure_delete_products(callback: types.CallbackQuery):
 async def admin_delete_products(callback: types.CallbackQuery):
     try:
         await database.delete_all_data()
+        await redis_delete_all_products()
         text = "Все товары успешно удалены"
     except Exception as e:
         text = f"Ошибка удаления: {e}"
@@ -2034,6 +2476,9 @@ async def get_csv_products(message: types.Message, state: FSMContext):
         builder.adjust(1)
         try:
             await database.upload_products(temp_file_path)
+            products = await database.fetch_products("all")
+            await redis_delete_all_products() # Если вылезет ошибка то проверить эту строку
+            await cache_products(products)
             await bot.send_message(text="Загрузка закончена", chat_id=ADMIN_ID, reply_markup=builder.as_markup())
         except Exception as e:
             await bot.send_message(text=f"Ошибка загрузки: {e}", chat_id=ADMIN_ID, reply_markup=builder.as_markup())
@@ -2048,9 +2493,11 @@ async def get_csv_products(message: types.Message, state: FSMContext):
 # Поменять цену
 @dp.callback_query(lambda c: c.data == "change_price")
 async def admin_change_price(callback: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    products = data.get("products", [])
-    current_index = data.get("current_index", 0)
+    index = await get_brand_and_index(callback.from_user.id)
+    brand = index["brand"]
+    current_index = int(index["current_index"])
+    watch_mode = index["watch_mode"]
+    products = await get_products_from_index(watch_mode, brand)
     if products == []:
         await callback.answer(text="Ошибка, список товаров для просмотра пуст. Перезапусти каталог", show_alert=True)
         return
@@ -2071,11 +2518,13 @@ async def admin_change_price(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data == "cancel_change_price")
 async def back_to_catalog_admin_price(callback: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    products = data.get("products", [])
+    index = await get_brand_and_index(callback.from_user.id)
+    brand = index["brand"]
+    current_index = int(index["current_index"])
+    watch_mode = index["watch_mode"]
+    products = await get_products_from_index(watch_mode, brand)
+    back_mode = index["back_mode"]
     total_products = len(products)
-    current_index = data.get("current_index", 0)
-    back_mode = data.get("search_back_mode", 0)
     await send_or_update_product(callback.message.chat.id, callback.message.message_id,
                                  products[current_index], current_index, total_products, is_edit=True,
                                  back_mode=back_mode)
@@ -2083,8 +2532,11 @@ async def back_to_catalog_admin_price(callback: types.CallbackQuery, state: FSMC
 @dp.message(adminStates.waiting_for_new_price)
 async def get_new_admin_price(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    products = data.get("products", [])
-    current_index = data.get("current_index", 0)
+    index = await get_brand_and_index(message.from_user.id)
+    brand = index["brand"]
+    current_index = int(index["current_index"])
+    watch_mode = index["watch_mode"]
+    products = await get_products_from_index(watch_mode, brand)
     last_message_id = data.get("last_message_id", -1)
     product = products[current_index]
     if products == []:
@@ -2110,14 +2562,15 @@ async def get_new_admin_price(message: types.Message, state: FSMContext):
     )
 
 @dp.callback_query(lambda c: c.data.startswith("finally_price:"))
-async def finally_change_price(callback: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    products = data.get("products", [])
-    total_products = len(products)
-    current_index = data.get("current_index", 0)
-    back_mode = data.get("search_back_mode", 0)
-    brand = data.get("brand", -1)
+async def finally_change_price(callback: types.CallbackQuery):
+    index = await get_brand_and_index(callback.from_user.id)
+    brand = index["brand"]
+    current_index = int(index["current_index"])
+    watch_mode = index["watch_mode"]
+    back_mode = index["back_mode"]
+    products = await get_products_from_index(watch_mode, brand)
     product = products[current_index]
+    total_products = len(products)
 
     new_price = int(callback.data.split(":")[1])
 
@@ -2128,7 +2581,8 @@ async def finally_change_price(callback: types.CallbackQuery, state: FSMContext)
     if brand != -1:
         products_from_brand = await database.fetch_products(brand)
         products = products_from_brand[::-1]
-        await state.update_data(products=products)
+        await redis_delete_all_products()
+        await cache_products(products)
     await send_or_update_product(callback.message.chat.id, callback.message.message_id,
                                  products[current_index], current_index, total_products, is_edit=True,
                                  back_mode=back_mode)
@@ -2138,11 +2592,12 @@ async def finally_change_price(callback: types.CallbackQuery, state: FSMContext)
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 # Удаление товара
 @dp.callback_query(lambda c: c.data == "admin_delete_product")
-async def sure_delete_admin_product(callback: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    products = data.get("products", [])
-    current_index = data.get("current_index", 0)
-    back_mode = data.get("search_back_mode", 0)
+async def sure_delete_admin_product(callback: types.CallbackQuery):
+    index = await get_brand_and_index(callback.from_user.id)
+    brand = index["brand"]
+    current_index = int(index["current_index"])
+    watch_mode = index["watch_mode"]
+    products = await get_products_from_index(watch_mode, brand)
     if products == []:
         await send_admin_message("Ошибка, список товаров для просмотра пуст. Перезапусти каталог")
         return
@@ -2159,22 +2614,22 @@ async def sure_delete_admin_product(callback: types.CallbackQuery, state: FSMCon
     )
 
 @dp.callback_query(lambda c: c.data == "yes_delete_product")
-async def delete_admin_product(callback: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    products = data.get("products", [])
+async def delete_admin_product(callback: types.CallbackQuery):
+    index = await get_brand_and_index(callback.from_user.id)
+    brand = index["brand"]
+    current_index = int(index["current_index"])
+    watch_mode = index["watch_mode"]
+    back_mode = index["back_mode"]
+    products = await get_products_from_index(watch_mode, brand)
     total_products = len(products)
-    current_index = data.get("current_index", 0)
-    back_mode = data.get("search_back_mode", 0)
-    brand = data.get("brand", -1)
     if products == []:
         await send_admin_message("Ошибка, список товаров для просмотра пуст. Перезапусти каталог")
         return
     product = products[current_index]
     await database.delete_product(product["art"])
-    if brand != -1:
-        products = await database.fetch_products(brand)
-        total_products = len(products)
-        await state.update_data(products=products)
+    products = await database.fetch_products("all")
+    await redis_delete_all_products()
+    await cache_products(products)
     try:
         await send_or_update_product(callback.message.chat.id, callback.message.message_id,
                                      products[current_index], current_index, total_products, is_edit=True,
@@ -2182,6 +2637,194 @@ async def delete_admin_product(callback: types.CallbackQuery, state: FSMContext)
     except Exception:
         await start_handler(message=callback.message)
 
+
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# Замена ссылки на пост у конкретного товара
+@dp.callback_query(lambda c: c.data == "change_post_link")
+async def edit_post_link(callback: types.CallbackQuery, state: FSMContext):
+    await bot.delete_message(chat_id=callback.from_user.id, message_id=callback.message.message_id)
+    new_message = await bot.send_message(text="Отправь новую ссылку на пост в канале или 0 если её пока нет", chat_id=callback.from_user.id)
+    await state.update_data(last_message_id=new_message.message_id)
+    await state.set_state(adminStates.waiting_for_post_link)
+
+@dp.message(adminStates.waiting_for_post_link)
+async def get_new_post_link(message: types.Message, state: FSMContext):
+    link = message.text
+    index = await get_brand_and_index(ADMIN_ID)
+    brand = index["brand"]
+    current_index = int(index["current_index"])
+    watch_mode = index["watch_mode"]
+    products = await get_products_from_index(watch_mode, brand)
+    if products == []:
+        await send_admin_message("Ошибка, список товаров для просмотра пуст. Перезапусти каталог")
+        return
+    product = products[current_index]
+    await database.edit_post_link(art=product["art"], new_link=link)
+    await redis_delete_all_products()
+    products = await database.fetch_products("all")
+    await cache_products(products)
+
+    data = await state.get_data()
+    last_message_id = data.get("last_message_id")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Ok", callback_data="same")
+    await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+    await bot.edit_message_text(text=f"Ссылка изменена на {link}", chat_id=message.chat.id, message_id=last_message_id, reply_markup=builder.as_markup())
+    await state.clear()
+
+
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# Загрузить доп фото из csv
+@dp.callback_query(lambda c: c.data == "add_photo_links")
+async def request_file_csv(callback: types.CallbackQuery, state: FSMContext):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ Отмена",callback_data="admin")
+    await bot.edit_message_text(
+        text="Отправь csv файл для загрузки фото. (Макс 50 мб)",
+        chat_id=ADMIN_ID,
+        message_id=callback.message.message_id,
+        reply_markup=builder.as_markup()
+    )
+    await state.set_state(adminStates.waiting_for_photos_csv_file)
+
+@dp.message(adminStates.waiting_for_photos_csv_file)
+async def get_csv_products(message: types.Message, state: FSMContext):
+    if message.document.file_name.endswith('.csv'):
+        file_id = message.document.file_id
+        file = await bot.get_file(file_id)
+        file_path = file.file_path
+        temp_file_path = f"temp_{file_id}.csv"
+        await bot.download_file(file_path, temp_file_path)
+        builder = InlineKeyboardBuilder()
+        builder.button(text="✔️ Ок", callback_data="admin")
+        builder.button(text="🔄 Попробовать ещё раз", callback_data="admin")
+        builder.adjust(1)
+        try:
+            await database.upload_photo_links(temp_file_path)
+            await bot.send_message(text="Загрузка закончена", chat_id=ADMIN_ID, reply_markup=builder.as_markup())
+            await database.fetchall_dop_photos()
+        except Exception as e:
+            await bot.send_message(text=f"Ошибка загрузки: {e}", chat_id=ADMIN_ID, reply_markup=builder.as_markup())
+        os.remove(temp_file_path)
+        await state.clear()
+    else:
+        await message.answer("Пожалуйста отправь файл .csv")
+
+
+
+async def show_all_photos(arg, message, state):
+    index = await get_brand_and_index(message.from_user.id)
+    brand = index["brand"]
+    current_index = int(index["current_index"])
+    watch_mode = index["watch_mode"]
+    products = await get_products_from_index(watch_mode, brand)
+    product = products[current_index]
+    data_arg = arg.split("photos")
+    art = data_arg[0]
+    last_message_id = data_arg[1]
+    other_links = await database.fetch_photo_links_by_art(art)
+    links = []
+    links.append(product["photo_url"])
+    for link in other_links:
+        links.append(link)
+    media_group = []
+    for url in links:
+        media_group.append(types.InputMediaPhoto(media=url))
+    builder = InlineKeyboardBuilder()
+    builder.button(text="◀️ Назад", callback_data="hide_photos")
+    await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+    messages = await bot.send_media_group(media=media_group, chat_id=message.chat.id)
+    message_ids = [mes.message_id for mes in messages]
+    await state.update_data(message_ids=message_ids)
+    await bot.send_message(text=f"<b>{product['name']}</b>", chat_id=message.chat.id, parse_mode="HTML", reply_markup=builder.as_markup())
+
+
+# Убрать 4 фото
+@dp.callback_query(lambda c: c.data == "hide_photos")
+async def hide_product_photos(callback: types.CallbackQuery, state: FSMContext):
+    await bot.delete_message(chat_id=callback.from_user.id, message_id=callback.message.message_id)
+    data = await state.get_data()
+    message_ids = data.get("message_ids")
+    for mes_id in message_ids:
+        await bot.delete_message(chat_id=callback.from_user.id, message_id=mes_id)
+
+
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# Получить текущий список товаров
+@dp.callback_query(lambda c: c.data == "get_current_product_list")
+async def get_bot_users(callback: types.CallbackQuery):
+    db_products = await database.fetch_products("all")
+    products = sorted(db_products, key=lambda item: int(item["id"]))
+    file_content = ""
+    i = 0
+    for product in products:
+        file_content += f"{product['type']},{product['name']},{product['maker'].replace(",", ":")},{product['material'].replace(", ", ":")},{product['season'].replace(", ", ":")},{product['brand']},{product['price']},{product['art']},{product['photo_url']},{product['channel_url']},{product['anki_url']}\n"
+        i += 1
+
+    with open("products.txt", "w", encoding="utf-8") as file:
+        file.write(file_content)
+
+    with open("products.txt", "rb") as file:
+        file_data = file.read()
+        input_file = BufferedInputFile(file_data, filename="products.txt")
+        await bot.send_document(ADMIN_ID, input_file, caption="👟 Текущий список товаров")
+
+    os.remove("products.txt")
+
+
+
+# Загрузить таблицы размеров txt
+@dp.callback_query(lambda c: c.data == "add_sizes_length")
+async def ack_txt_sizes_length(callback: types.CallbackQuery, state: FSMContext):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ Отмена", callback_data="admin")
+    await bot.edit_message_text(
+        chat_id=callback.message.chat.id,
+        message_id=callback.message.message_id,
+        text="Отправь файл с длинами размеров в .txt (Пока что json полностью перезаписывается, поэтому отправь полный файл)",
+        reply_markup=builder.as_markup()
+    )
+    await state.set_state(adminStates.waiting_for_sizes_length)
+
+@dp.message(adminStates.waiting_for_sizes_length)
+async def get_csv_products(message: types.Message, state: FSMContext):
+    if message.document.file_name.endswith('.txt'):
+        file_id = message.document.file_id
+        file = await bot.get_file(file_id)
+        file_path = file.file_path
+        temp_file_path = f"temp_{file_id}.txt"
+        await bot.download_file(file_path, temp_file_path)
+        builder = InlineKeyboardBuilder()
+        builder.button(text="✔️ Ок", callback_data="admin")
+        builder.button(text="🔄 Попробовать ещё раз", callback_data="admin")
+        builder.adjust(1)
+        with open(temp_file_path) as file:
+            all_length = []
+            for row in file:
+                pices = row.split(";")
+                art = pices[0]
+                sizes = pices[1]
+                sizes = sizes.split(",")
+                del sizes[-1]
+                sizes_length = {}
+                for size in sizes:
+                    size_pices = size.split(":")
+                    eu = size_pices[0].strip()
+                    length = size_pices[1].strip()
+                    sizes_length[eu] = length
+                length_dict = {"art": art, "sizes": sizes_length}
+                all_length.append(length_dict)
+        with open('sizes_lengths.json', 'w', encoding='utf-8') as f:
+            json.dump(all_length, f, ensure_ascii=False, indent=2)
+        await cache_sizes_length()
+        await bot.send_message(text="Загрузка закончена", chat_id=ADMIN_ID, reply_markup=builder.as_markup())
+        os.remove(temp_file_path)
+        await state.clear()
+    else:
+        await message.answer("Пожалуйста отправь файл .txt")
 
 
 if __name__ == '__main__':
