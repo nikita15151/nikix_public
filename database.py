@@ -35,7 +35,8 @@ async def init_db():
                 art VARCHAR(30) UNIQUE,
                 photo_url TEXT,
                 channel_url TEXT,
-                anki_url
+                anki_url TEXT,
+                drop INTEGER
                 );
             ''')
 
@@ -54,8 +55,7 @@ async def init_db():
                 comment TEXT,
                 delivery_price INTEGER,
                 message_from_channel INTEGER,
-                when_buy DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(user_id) REFERENCES user(id) ON DELETE CASCADE
+                when_buy DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
             ''')
 
@@ -74,16 +74,24 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS basket(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
-                product_id INTEGER,
-                size VARCHAR(10),
-                FOREIGN KEY(user_id) REFERENCES user(id) ON DELETE CASCADE,
-                FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+                art VARCHAR(30),
+                size VARCHAR(10)
                 );
             ''')
 
+        # Таблица ссылок на фото
+        await db.execute('''
+                    CREATE TABLE IF NOT EXISTS photo_links(
+                        art VARCHAR(30) UNIQUE,
+                        photo2_url TEXT,
+                        photo3_url TEXT,
+                        photo4_url TEXT
+                        );
+                    ''')
+
         # индексы
         await db.execute('CREATE INDEX IF NOT EXISTS idx_basket_user_id ON basket(user_id);')
-        await db.execute('CREATE INDEX IF NOT EXISTS idx_basket_product_id ON basket(product_id);')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_basket_art ON basket(art);')
 
         await db.execute('CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id);')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_orders_when_buy ON orders(when_buy)')
@@ -111,10 +119,12 @@ async def upload_products(csv_file_path):
                 for row in reader:
                     try:
                         cleaned_row = {key.strip(): (value.strip() if value else "") for key, value in row.items()}
+                        if cleaned_row["drop"] not in ["0", "1"]:
+                            cleaned_row["drop"] = "0"
                         await db.execute('''
-                        INSERT INTO products (type, name, maker, material, season, brand, price, art, photo_url, channel_url, anki_url)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                        ''', (cleaned_row['type'], cleaned_row['name'], cleaned_row['maker'], cleaned_row['material'].replace(":", ", "), cleaned_row['season'].replace(":", ", "), cleaned_row['brand'], int(cleaned_row['price']), cleaned_row['art'], cleaned_row['photo_url'], cleaned_row['channel_url'], cleaned_row['anki_url']))
+                        INSERT INTO products (type, name, maker, material, season, brand, price, art, photo_url, channel_url, anki_url, drop)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        ''', (cleaned_row['type'], cleaned_row['name'], cleaned_row['maker'], cleaned_row['material'].replace(":", ", ").lower(), cleaned_row['season'].replace(":", ", "), cleaned_row['brand'], int(cleaned_row['price']), cleaned_row['art'], cleaned_row['photo_url'], cleaned_row['channel_url'], cleaned_row['anki_url'], int(cleaned_row["drop"])))
                     except Exception as e:
                         flag = 1
                         await asyncio.sleep(0.2)
@@ -138,7 +148,8 @@ async def fetch_products(brand: str):
         else:
             cursor = await db.execute('SELECT * FROM products WHERE brand = ?', (brand,))
         rows = await cursor.fetchall()
-        products = [{"id": row[0], "type": row[1], "name": row[2], "maker": row[3], "material": row[4], "season": row[5], "brand": row[6], "price": row[7], "art": row[8], "photo_url": row[9], "channel_url": row[10], "anki_url": row[11]} for row in rows]
+        products = [{"id": row[0], "type": row[1], "name": row[2], "maker": row[3], "material": row[4], "season": row[5], "brand": row[6], "price": row[7], "art": row[8], "photo_url": row[9], "channel_url": row[10], "anki_url": row[11], "drop": row[12]} for row in rows]
+        print(products[0])
         return products
 
 #Взять названия брендов из базы
@@ -149,9 +160,9 @@ async def fetch_brands():
         return [row[0] for row in brands if row[0]] #Возвращение списка, исключая None или пустые значения
 
 #Добавить товар в корзину
-async def add_to_basket(user_id: int, product_id: int, size: str):
+async def add_to_basket(user_id: int, art: int, size: str):
     async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute('INSERT INTO basket (user_id, product_id, size) VALUES (?, ?, ?)', (user_id, product_id, size))
+        await db.execute('INSERT INTO basket (user_id, art, size) VALUES (?, ?, ?)', (user_id, art, size))
         await db.commit()
 
 #Получение товаров из корзины
@@ -160,7 +171,7 @@ async def fetch_basket(user_id: int, count=False):
         query = """
         SELECT b.id AS basket_id, p.id AS product_id, p.name, p.price, photo_url, b.size, p.art, p.channel_url
         FROM basket b
-        INNER JOIN products p ON b.product_id = p.id
+        INNER JOIN products p ON b.art = p.art
         WHERE b.user_id = ?
         """
         cursor = await db.execute(query, (user_id,))
@@ -215,7 +226,7 @@ async def fetch_users(onlyID=0):
         else:
             cursor = await db.execute("SELECT id, user_id, user_name, first_name, when_created FROM users")
             rows = await cursor.fetchall()
-            users = [{"id": row[0], "user_id": row[1], "user_name": row[2], "first_name": row[3], "when_created": row[4]} for row in rows]
+            users = [{"id": row[0], "user_id": row[1], "user_name": row[2], "first_name": row[3]} for row in rows]
             await cursor.close()
             return users
 
@@ -338,4 +349,60 @@ async def delete_product(art: str):
             await db.execute("DELETE FROM products WHERE art = ?", (art,))
             await db.commit()
         except Exception as e:
-            await send_admin_message(f"Не удалось далить товар: {e}")
+            await send_admin_message(f"Не удалось удалить товар: {e}")
+
+
+# Загрузка ссылок на фото в базу, перед загрузкой происходит автоматическое удаление старых ссылок
+async def upload_photo_links(csv_file_path):
+    flag = 0
+    async with (aiosqlite.connect(DATABASE_PATH) as db):
+        await db.execute("DELETE FROM photo_links")
+        await db.commit()
+        async with db.execute('BEGIN'):
+            with open(csv_file_path, 'r', encoding='utf-8') as csv_file:
+                reader = csv.DictReader(csv_file)
+                reader.fieldnames = [field.strip() for field in reader.fieldnames]
+                for row in reader:
+                    try:
+                        cleaned_row = {key.strip(): (value.strip() if value else "") for key, value in row.items()}
+                        await db.execute("INSERT INTO photo_links (art, photo2_url, photo3_url, photo4_url) VALUES (?, ?, ?, ?)", (cleaned_row["art"], cleaned_row["photo2_url"], cleaned_row["photo3_url"], cleaned_row["photo4_url"]))
+                    except Exception as e:
+                        flag = 1
+                        await asyncio.sleep(0.2)
+                        await send_admin_message(message=f"Ошибка при загрузке строки {row}: {e}", is_log=True)
+
+        await db.commit()
+    if flag == 0:
+        await send_admin_message('Загрузка таблицы успешно завершена')
+    else:
+        await send_admin_message('Загрузка таблицы завершена с ошибками. Посмотри логи!')
+
+
+
+# Получить ссылки по артикулу
+async def fetch_photo_links_by_art(art):
+    photo_links = []
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute('SELECT photo_url FROM products WHERE art = ?', (art,))
+        row = await cursor.fetchone()
+        photo_links.append(row[0])
+        cursor = await db.execute("SELECT photo2_url, photo3_url, photo4_url FROM photo_links WHERE art = ?", (art,))
+        rows = await cursor.fetchone()
+        return rows
+
+
+async def fetchall_dop_photos():
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute("SELECT p.art, p.photo_url, u.photo2_url, u.photo3_url, u.photo4_url FROM products p INNER JOIN photo_links u ON p.art = u.art")
+        rows = await cursor.fetchall()
+        print(rows)
+
+
+#
+async def edit_post_link(art, new_link):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        try:
+            await db.execute("UPDATE products SET channel_url = ? WHERE art = ?", (new_link, art))
+            await db.commit()
+        except Exception as e:
+            await send_admin_message(f"Не удалось изменить ссылку: {e}")
